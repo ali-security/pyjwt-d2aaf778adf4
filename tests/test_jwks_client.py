@@ -1,9 +1,13 @@
 import contextlib
+import io
 import json
 import ssl
+import threading
 import time
+from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -11,6 +15,7 @@ import jwt
 from jwt import PyJWKClient
 from jwt.api_jwk import PyJWK
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError
+from jwt.jwks_client import _NoRedirectHandler
 
 from .utils import crypto_required
 
@@ -47,7 +52,10 @@ RESPONSE_DATA_NO_MATCHING_KID = {
 
 @contextlib.contextmanager
 def mocked_success_response(data):
-    with mock.patch("urllib.request.urlopen") as urlopen_mock:
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
         response = mock.Mock()
         response.__enter__ = mock.Mock(return_value=response)
         response.__exit__ = mock.Mock()
@@ -58,7 +66,10 @@ def mocked_success_response(data):
 
 @contextlib.contextmanager
 def mocked_failed_response():
-    with mock.patch("urllib.request.urlopen") as urlopen_mock:
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
         urlopen_mock.side_effect = URLError("Fail to process the request.")
         yield urlopen_mock
 
@@ -67,7 +78,10 @@ def mocked_failed_response():
 def mocked_first_call_wrong_kid_second_call_correct_kid(
     response_data_one, response_data_two
 ):
-    with mock.patch("urllib.request.urlopen") as urlopen_mock:
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
         response = mock.Mock()
         response.__enter__ = mock.Mock(return_value=response)
         response.__exit__ = mock.Mock()
@@ -81,13 +95,149 @@ def mocked_first_call_wrong_kid_second_call_correct_kid(
 
 @contextlib.contextmanager
 def mocked_timeout():
-    with mock.patch("urllib.request.urlopen") as urlopen_mock:
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
         urlopen_mock.side_effect = TimeoutError("timed out")
         yield urlopen_mock
 
 
+@contextlib.contextmanager
+def mocked_http_error_response():
+    with mock.patch("urllib.request.build_opener") as build_opener_mock:
+        opener = mock.Mock()
+        build_opener_mock.return_value = opener
+        urlopen_mock = opener.open
+        http_error = HTTPError(
+            url="https://example.com",
+            code=401,
+            msg="Unauthorized",
+            hdrs=Message(),
+            fp=io.BytesIO(b""),
+        )
+        urlopen_mock.side_effect = http_error
+        yield urlopen_mock, http_error
+
+
+@contextlib.contextmanager
+def redirecting_jwks_server(redirect_code):
+    """Serve a JWKS endpoint at /start that redirects to an attacker-controlled
+    /destination serving its own JWKS, recording every destination request."""
+    destination_headers = []
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib handler API
+            if self.path == "/start":
+                self.send_response(redirect_code)
+                self.send_header("Location", f"{base_url}/destination")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                destination_headers.append(dict(self.headers))
+                body = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"{base_url}/start", destination_headers
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 @crypto_required
 class TestPyJWKClient:
+    def test_fetch_data_rejects_redirect_without_contacting_destination(self):
+        destination_requests = 0
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib handler API
+                nonlocal destination_requests
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", f"{base_url}/destination")
+                    self.end_headers()
+                else:
+                    destination_requests += 1
+                    self.send_response(200)
+                    self.end_headers()
+
+            def log_message(self, _format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = PyJWKClient(
+                f"{base_url}/start", headers={"Authorization": "secret"}
+            )
+            with pytest.raises(PyJWKClientConnectionError):
+                client.fetch_data()
+            assert destination_requests == 0
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    @pytest.mark.parametrize("redirect_code", [301, 302, 303, 307, 308])
+    def test_get_signing_key_rejects_redirect_to_attacker_jwks(self, redirect_code):
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+
+        with redirecting_jwks_server(redirect_code) as (url, destination_headers):
+            jwks_client = PyJWKClient(
+                url, headers={"Authorization": "Bearer secret-token"}
+            )
+
+            # The redirect is surfaced as a connection error instead of being
+            # followed: no caller headers leak to the destination, no request
+            # is made to it, and its key material is neither trusted nor cached.
+            with pytest.raises(PyJWKClientConnectionError) as exc:
+                jwks_client.get_signing_key(kid)
+
+            assert f"HTTP Error {redirect_code}" in str(exc.value)
+            assert destination_headers == []
+            assert jwks_client.jwk_set_cache is not None
+            assert jwks_client.jwk_set_cache.get() is None
+
+    def test_redirect_handler_does_not_follow_redirects(self):
+        handler = _NoRedirectHandler()
+
+        assert (
+            handler.redirect_request(
+                mock.Mock(),
+                mock.Mock(),
+                302,
+                "Found",
+                mock.Mock(),
+                "https://other.test",
+            )
+            is None
+        )
+
+    def test_http_error_is_closed_on_connection_failure(self):
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mocked_http_error_response() as (_, http_error):
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.get_jwk_set()
+
+            assert http_error.closed
+
     def test_fetch_data_forwards_headers_to_correct_url(self):
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
 
@@ -342,10 +492,19 @@ class TestPyJWKClient:
         ssl_ctx = ssl.create_default_context()
         jwks_client = PyJWKClient(url, ssl_context=ssl_ctx)
 
-        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as mock_request:
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = mock.Mock()
+            build_opener_mock.return_value = opener
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock()
+            response.read.return_value = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID)
+            opener.open.return_value = response
             jwk_set = jwks_client.get_jwk_set()
-            request_call = mock_request.call_args
-            assert request_call[1].get("context") is ssl_ctx
+            handlers = build_opener_mock.call_args.args
+            assert any(
+                getattr(handler, "_context", None) is ssl_ctx for handler in handlers
+            )
 
         assert jwk_set is not None
 
@@ -355,8 +514,8 @@ class TestPyJWKClient:
             url, ssl_context=ssl.SSLContext(protocol=ssl.PROTOCOL_TLS_CLIENT)
         )
 
-        with mock.patch("urllib.request.urlopen") as urlopen_mock:
-            urlopen_mock.side_effect = URLError(
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            build_opener_mock.return_value.open.side_effect = URLError(
                 ssl.SSLCertVerificationError("certificate verify failed")
             )
             with pytest.raises(PyJWKClientError):
