@@ -2,14 +2,6 @@
 name: Build & maybe upload PyPI package
 
 on:
-  push:
-    branches: [master]
-    tags: ["*"]
-  pull_request:
-    branches: [master]
-  release:
-    types:
-      - published
   workflow_dispatch:
 
 permissions:
@@ -21,7 +13,9 @@ jobs:
   # Always build & lint package.
   build-package:
     name: Build & verify package
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -34,8 +28,9 @@ jobs:
   release-test-pypi:
     name: Publish in-dev package to test.pypi.org
     environment: release-test-pypi
-    if: github.repository_owner == 'jpadilla' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: build-package
 
     steps:
@@ -54,8 +49,9 @@ jobs:
   release-pypi:
     name: Publish released package to pypi.org
     environment: release-pypi
-    if: github.repository_owner == 'jpadilla' && github.event.action == 'published'
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: build-package
 
     steps:

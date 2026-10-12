@@ -2,16 +2,19 @@
 name: CI
 
 on:
-  push:
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional test selector passed to tox posargs"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   tests:
     name: "Python ${{ matrix.python-version }} on ${{ matrix.platform }}"
     runs-on: "${{ matrix.platform }}"
+    timeout-minutes: 30
     env:
       USING_COVERAGE: '3.9'
 
@@ -46,7 +49,7 @@ jobs:
           python -m pip install --upgrade coverage[toml] virtualenv tox tox-gh-actions
 
       - name: "Run tox targets for ${{ matrix.python-version }}"
-        run: "python -m tox"
+        run: "python -m tox -- ${{ inputs.test-filter }}"
 
       # We always use a modern Python version for combining coverage to prevent
       # parsing errors in older versions for modern code.
@@ -62,17 +65,10 @@ jobs:
           python -m coverage xml
         if: "contains(env.USING_COVERAGE, matrix.python-version) && matrix.platform == 'ubuntu-latest'"
 
-      - name: "Upload coverage to Codecov"
-        if: "contains(env.USING_COVERAGE, matrix.python-version) && matrix.platform == 'ubuntu-latest'"
-        uses: "codecov/codecov-action@v5"
-        with:
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-
   package:
     name: "Build & verify package"
     runs-on: "ubuntu-latest"
+    timeout-minutes: 30
 
     steps:
       - uses: "actions/checkout@v6"
@@ -82,16 +78,29 @@ jobs:
           python-version: "3.9"
 
       - name: "Install build and twine"
-        run: "python -m pip install build twine"
+        run: 'python -m pip install "setuptools==80.10.2" build twine'
+
+      - name: "Remove standalone wheel distribution"
+        run: |
+          if python -m pip show wheel >/dev/null 2>&1; then python -m pip uninstall -y wheel; fi
 
       - name: "Build package"
-        run: "python -m build"
+        run: "python -m build --no-isolation"
+
+      - name: "Check wheel Generator"
+        run: "unzip -p dist/*.whl '*.dist-info/WHEEL' | grep -qx 'Generator: setuptools (80.10.2)'"
 
       - name: "List result"
         run: "ls -l dist"
 
       - name: "Check long_description"
         run: "python -m twine check dist/*"
+
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "dist"
+          path: "dist/*"
+          if-no-files-found: "error"
 
   install-dev:
     strategy:
@@ -100,6 +109,7 @@ jobs:
 
     name: "Verify dev env"
     runs-on: "${{ matrix.os }}"
+    timeout-minutes: 30
 
     steps:
       - uses: "actions/checkout@v6"
