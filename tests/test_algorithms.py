@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 from typing import Any, cast
 
 import pytest
@@ -88,6 +89,57 @@ class TestAlgorithms:
         with pytest.raises(InvalidKeyError):
             with open(key_path(key)) as keyfile:
                 algo.prepare_key(keyfile.read())
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            lambda key: key.replace(b"-----END", b"\t-----END"),
+            lambda key: key.replace(b"-----END", b" -----END"),
+            lambda key: key.replace(b"\n", b"\r"),
+            lambda key: key.replace(b"\n", b""),
+        ],
+    )
+    def test_hmac_should_reject_loader_accepted_pem_mutations(self, mutation):
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        with open(key_path("testkey2_rsa.pub.pem"), "rb") as keyfile:
+            mutated_key = mutation(keyfile.read())
+
+        with pytest.raises(InvalidKeyError):
+            algo.prepare_key(mutated_key)
+
+    def test_hmac_should_accept_incomplete_pem_marker(self):
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        key = b"-----BEGIN PUBLIC KEY-----" * 10000
+
+        assert algo.prepare_key(key) == key
+
+    def test_hmac_should_scan_unterminated_pem_lines_in_linear_time(self):
+        # Repeated BEGIN lines without an END marker made the previous PEM
+        # regex rescan the rest of the input from every line (quadratic time).
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        key = b"-----BEGIN CERTIFICATE-----\n" * 10000
+
+        start = time.perf_counter()
+        assert algo.prepare_key(key) == key
+        assert time.perf_counter() - start < 5
+
+    def test_hmac_should_reject_a_later_pem_block(self):
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        with open(key_path("testkey2_rsa.pub.pem"), "rb") as keyfile:
+            key = b"-----BEGIN PUBLIC KEY-----" + keyfile.read()
+
+        with pytest.raises(InvalidKeyError):
+            algo.prepare_key(key)
+
+    def test_hmac_should_reject_a_pem_block_after_an_overlapping_end_marker(
+        self,
+    ):
+        algo = HMACAlgorithm(HMACAlgorithm.SHA256)
+        with open(key_path("testkey2_rsa.pub.pem"), "rb") as keyfile:
+            key = b"-----END CERTIFICATE" + keyfile.read()
+
+        with pytest.raises(InvalidKeyError):
+            algo.prepare_key(key)
 
     def test_hmac_jwk_should_parse_and_verify(self):
         algo = HMACAlgorithm(HMACAlgorithm.SHA256)
