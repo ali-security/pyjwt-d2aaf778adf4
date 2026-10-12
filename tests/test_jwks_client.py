@@ -16,13 +16,14 @@ from jwt import PyJWKClient
 from jwt.api_jwk import PyJWK
 from jwt.exceptions import (
     DecodeError,
+    InvalidAlgorithmError,
     PyJWKClientConnectionError,
     PyJWKClientError,
 )
 from jwt.jwks_client import _NoRedirectHandler
 from jwt.utils import base64url_encode
 
-from .utils import crypto_required
+from .utils import crypto_required, key_path
 
 RESPONSE_DATA_WITH_MATCHING_KID = {
     "keys": [
@@ -348,6 +349,56 @@ class TestPyJWKClient:
 
         assert repeated_call.call_count == 1
 
+    @pytest.mark.parametrize(
+        "jwk_alg, key_alg, header_alg, sign_hash",
+        [
+            # JWK explicitly bound to RS512, header advertises allowed RS256.
+            ("RS512", "RS512", "RS256", "SHA512"),
+            # JWK without "alg" (PyJWK infers RS256), header advertises
+            # allowed RS512, token actually signed with RS256.
+            (None, "RS256", "RS512", "SHA256"),
+        ],
+    )
+    def test_get_signing_key_from_jwt_rejects_header_alg_not_bound_to_jwk(
+        self, jwk_alg, key_alg, header_alg, sign_hash
+    ):
+        # CVE-2026-48523: an attacker controlling a registered JWKS private
+        # key signs with an algorithm the relying party does not allow, but
+        # advertises an allowed algorithm in the token header. The token must
+        # not pass the documented get_signing_key_from_jwt() + decode()
+        # workflow, which only allows the header's algorithm.
+        from jwt.algorithms import RSAAlgorithm
+
+        with open(key_path("jwk_rsa_key.json")) as keyfile:
+            private_jwk = json.load(keyfile)
+        public_jwk = {k: private_jwk[k] for k in ("kty", "kid", "use", "n", "e")}
+        if jwk_alg is not None:
+            public_jwk["alg"] = jwk_alg
+
+        private_key = RSAAlgorithm.from_jwk(private_jwk)
+        header = {"alg": header_alg, "typ": "JWT", "kid": public_jwk["kid"]}
+        signing_input = b".".join(
+            [
+                base64url_encode(json.dumps(header, separators=(",", ":")).encode()),
+                base64url_encode(json.dumps({"sub": "attacker"}).encode()),
+            ]
+        )
+        signer = RSAAlgorithm(getattr(RSAAlgorithm, sign_hash))
+        signature = signer.sign(signing_input, private_key)
+        token = b".".join([signing_input, base64url_encode(signature)]).decode()
+
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+        with mocked_success_response({"keys": [public_jwk]}):
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+
+        assert signing_key.algorithm_name == key_alg
+
+        with pytest.raises(
+            InvalidAlgorithmError, match="does not match the key's algorithm"
+        ):
+            jwt.decode(token, signing_key, algorithms=[header_alg])
+
     def test_get_signing_key_from_jwt(self):
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
@@ -467,18 +518,30 @@ class TestPyJWKClient:
 
         assert repeated_call.call_count == 1
 
-    def test_get_jwt_set_failed_request_should_clear_cache(self):
+    def test_get_jwt_set_failed_refresh_preserves_cached_jwks(self):
+        # Regression: a transient fetch failure used to clear the cache via
+        # the previous `finally: put(jwk_set=None)` pattern, turning one bad
+        # request from the JWKS endpoint into application-wide auth failure.
+        # The cache must survive.
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
 
         jwks_client = PyJWKClient(url)
         with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
             jwks_client.get_jwk_set()
 
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is not None
+
         with pytest.raises(PyJWKClientError):
             with mocked_failed_response():
                 jwks_client.get_jwk_set(refresh=True)
 
-            assert jwks_client.jwk_set_cache is None
+        cached = jwks_client.jwk_set_cache.get()
+        assert cached is not None
+        # Subsequent reads still serve from cache without another fetch.
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as call:
+            jwks_client.get_jwk_set()
+        assert call.call_count == 0
 
     def test_failed_request_should_raise_connection_error(self):
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
@@ -687,6 +750,36 @@ class TestPyJWKClient:
         with pytest.raises(PyJWKClientError):
             jwks_client = PyJWKClient(url, lifespan=-1)
             assert jwks_client is None
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:///etc/passwd",
+            "ftp://example.org/keys.json",
+            'data:application/json,{"keys":[]}',
+            "/etc/passwd",  # urlparse gives scheme="" -- also rejected
+            "ldap://internal.test/jwks",
+        ],
+    )
+    def test_pyjwkclient_rejects_non_http_schemes(self, uri):
+        # urllib's default OpenerDirector handles file://, ftp://, and data:
+        # URIs. PyJWKClient must reject these so callers can't be tricked
+        # into reading attacker-controlled local files or other unintended
+        # schemes via a manipulated URI.
+        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
+            PyJWKClient(uri)
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://localhost/jwks.json",
+            "https://example.test/jwks.json",
+            "HTTPS://Example.Test/jwks.json",  # case-insensitive
+        ],
+    )
+    def test_pyjwkclient_accepts_http_https_schemes(self, uri):
+        # Construction succeeds; no fetch is made until get_jwk_set().
+        PyJWKClient(uri)
 
     def test_get_jwt_set_timeout(self):
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"

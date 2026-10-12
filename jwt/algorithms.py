@@ -363,6 +363,9 @@ class HMACAlgorithm(Algorithm):
     def prepare_key(self, key: str | bytes) -> bytes:
         key_bytes = force_bytes(key)
 
+        if len(key_bytes) == 0:
+            raise InvalidKeyError("HMAC key must not be empty.")
+
         if (
             is_pem_format(key_bytes)
             or is_ssh_key(key_bytes)
@@ -372,6 +375,26 @@ class HMACAlgorithm(Algorithm):
                 "The specified key is an asymmetric key or x509 certificate and"
                 " should not be used as an HMAC secret."
             )
+
+        # Defense against algorithm-confusion attacks: an attacker with
+        # control over the token header can force this code path by setting
+        # alg=HS*, and HMACAlgorithm is the only algorithm that accepts
+        # arbitrary bytes as a valid secret. Other algorithms reject
+        # non-key-shaped input naturally. Even a symmetric (kty=oct) JWK
+        # should be loaded via PyJWK / from_jwk rather than fed as raw JSON
+        # bytes (whose contents are not the secret material).
+        stripped = key_bytes.lstrip()
+        if stripped.startswith(b"{"):
+            try:
+                jwk_obj = json.loads(key_bytes)
+            except ValueError:
+                jwk_obj = None
+            if isinstance(jwk_obj, dict) and "kty" in jwk_obj:
+                raise InvalidKeyError(
+                    "The specified key looks like a JWK and should not be "
+                    "used directly as an HMAC secret. Load it via "
+                    "PyJWK / HMACAlgorithm.from_jwk first."
+                )
 
         return key_bytes
 

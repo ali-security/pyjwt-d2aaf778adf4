@@ -9,6 +9,7 @@ from functools import lru_cache
 from ssl import SSLContext
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 from .api_jwk import PyJWK, PyJWKSet
 from .api_jwt import decode_complete as decode_token
@@ -44,6 +45,16 @@ class PyJWKClient:
     ):
         if headers is None:
             headers = {}
+        # urllib's default OpenerDirector also handles file://, ftp://, and
+        # data: URIs. Reject anything that isn't http(s) eagerly so a caller
+        # passing an attacker-influenced URL (e.g. taken from a `jku` token
+        # header) can't read local files or reach other unintended schemes.
+        scheme = urlparse(uri).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise PyJWKClientError(
+                f"Invalid JWKS URI scheme {scheme!r}: only 'http' and 'https' "
+                f"are supported."
+            )
         self.uri = uri
         self.jwk_set_cache: JWKSetCache | None = None
         self.headers = headers
@@ -85,7 +96,6 @@ class PyJWKClient:
             self.get_signing_key = get_signing_key  # type: ignore[method-assign]
 
     def fetch_data(self) -> Any:
-        jwk_set: Any = None
         try:
             r = urllib.request.Request(url=self.uri, headers=self.headers)
             handlers: list[Any] = [_NoRedirectHandler()]
@@ -100,12 +110,16 @@ class PyJWKClient:
             raise PyJWKClientConnectionError(
                 f'Fail to fetch data from the url, err: "{e}"'
             ) from e
-        else:
-            self._last_successful_fetch = time.monotonic()
-            return jwk_set
-        finally:
-            if self.jwk_set_cache is not None:
-                self.jwk_set_cache.put(jwk_set)
+
+        self._last_successful_fetch = time.monotonic()
+
+        # Only update the cache on a successful fetch. Writing in a
+        # `finally` block with `jwk_set=None` on error clears any
+        # previously-cached JWKS, turning a transient outage into a cache
+        # wipe that breaks legitimate auth.
+        if self.jwk_set_cache is not None:
+            self.jwk_set_cache.put(jwk_set)
+        return jwk_set
 
     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
         data = None
