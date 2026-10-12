@@ -27,6 +27,10 @@ if TYPE_CHECKING:
     from .algorithms import AllowedPrivateKeys, AllowedPublicKeys
     from .types import SigOptions
 
+_BASE64URL_ALPHABET = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
 
 class PyJWS:
     header_typ = "JWT"
@@ -284,6 +288,36 @@ class PyJWS:
 
         return headers
 
+    @staticmethod
+    def _decode_base64url_segment(segment: bytes, name: str) -> bytes:
+        # Accept trailing '=' used by some issuers (e.g. AWS ALB). Still
+        # reject non-alphabet junk such as '!!!!' (GHSA-hxm8-2xgr-2p9m).
+        padding = 0
+        stripped = segment
+        while stripped.endswith(b"="):
+            stripped = stripped[:-1]
+            padding += 1
+            if padding > 2:
+                raise DecodeError(f"Invalid {name} padding")
+
+        if padding and len(segment) % 4 != 0:
+            raise DecodeError(f"Invalid {name} padding")
+
+        if len(stripped) % 4 == 1 or any(
+            character not in _BASE64URL_ALPHABET for character in stripped
+        ):
+            raise DecodeError(f"Invalid {name} padding")
+
+        try:
+            decoded = base64url_decode(stripped)
+        except (TypeError, binascii.Error) as err:
+            raise DecodeError(f"Invalid {name} padding") from err
+
+        if base64url_encode(decoded) != stripped:
+            raise DecodeError(f"Invalid {name} padding")
+
+        return decoded
+
     def _load(self, jwt: str | bytes) -> tuple[bytes, bytes, dict[str, Any], bytes]:
         if isinstance(jwt, str):
             jwt = jwt.encode("utf-8")
@@ -297,10 +331,7 @@ class PyJWS:
         except ValueError as err:
             raise DecodeError("Not enough segments") from err
 
-        try:
-            header_data = base64url_decode(header_segment)
-        except (TypeError, binascii.Error) as err:
-            raise DecodeError("Invalid header padding") from err
+        header_data = self._decode_base64url_segment(header_segment, "header")
 
         try:
             header: dict[str, Any] = json.loads(header_data)
@@ -310,15 +341,9 @@ class PyJWS:
         if not isinstance(header, dict):
             raise DecodeError("Invalid header string: must be a json object")
 
-        try:
-            payload = base64url_decode(payload_segment)
-        except (TypeError, binascii.Error) as err:
-            raise DecodeError("Invalid payload padding") from err
+        payload = self._decode_base64url_segment(payload_segment, "payload")
 
-        try:
-            signature = base64url_decode(crypto_segment)
-        except (TypeError, binascii.Error) as err:
-            raise DecodeError("Invalid crypto padding") from err
+        signature = self._decode_base64url_segment(crypto_segment, "crypto")
 
         return (payload, signing_input, header, signature)
 
