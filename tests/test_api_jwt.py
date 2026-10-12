@@ -996,3 +996,21 @@ class TestJWT:
         }
         with pytest.raises(InvalidIssuerError):
             jwt._validate_iss(payload, issuer=123)
+
+    # -------------------- Crit Header Tests --------------------
+
+    def test_decode_rejects_token_with_unknown_crit_extension(self, jwt: PyJWT) -> None:
+        """RFC 7515 §4.1.11: tokens with unsupported critical extensions MUST be rejected."""
+        from jwt.exceptions import InvalidTokenError
+
+        secret = "secret"
+        payload = {"sub": "attacker", "role": "admin"}
+        token = jwt.encode(
+            payload,
+            secret,
+            algorithm="HS256",
+            headers={"crit": ["x-custom-policy"], "x-custom-policy": "require-mfa"},
+        )
+
+        with pytest.raises(InvalidTokenError, match="Unsupported critical extension"):
+            jwt.decode(token, secret, algorithms=["HS256"])
