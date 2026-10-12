@@ -4,9 +4,11 @@ from calendar import timegm
 from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest import mock
 
 import pytest
 
+import jwt as pyjwt
 from jwt.api_jwt import PyJWT
 from jwt.exceptions import (
     DecodeError,
@@ -19,7 +21,7 @@ from jwt.exceptions import (
     InvalidSubjectError,
     MissingRequiredClaimError,
 )
-from jwt.utils import base64url_decode
+from jwt.utils import base64url_decode, base64url_encode
 from jwt.warnings import RemovedInPyjwt3Warning
 
 from .utils import crypto_required, key_path, utc_timestamp
@@ -158,6 +160,37 @@ class TestJWT:
             jwt.decode(example_jwt, example_secret, algorithms=["HS256"])
 
         assert "Invalid payload string" in str(exc.value)
+
+    def test_decode_deeply_nested_payload_throws_decode_error(self):
+        nested_payload = b"[" * 100_000 + b"]" * 100_000
+        token = ".".join(
+            (
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+                base64url_encode(nested_payload).decode(),
+                "",
+            )
+        )
+
+        with pytest.raises(DecodeError, match="Invalid payload") as exc:
+            pyjwt.decode(token, options={"verify_signature": False})
+
+        # Depending on the interpreter's stack limits the nested array is either
+        # rejected while parsing (RecursionError) or parsed and then rejected as
+        # a non-object payload; it must never escape as a bare RecursionError.
+        cause = exc.value.__cause__
+        assert cause is None or isinstance(cause, RecursionError)
+
+    def test_decode_payload_recursion_error_throws_decode_error(self):
+        token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.e30."
+
+        with mock.patch(
+            "jwt.api_jwt.json.loads",
+            side_effect=[{"alg": "none", "typ": "JWT"}, RecursionError()],
+        ):
+            with pytest.raises(DecodeError, match="Invalid payload") as exc:
+                pyjwt.decode(token, options={"verify_signature": False})
+
+        assert isinstance(exc.value.__cause__, RecursionError)
 
     def test_decode_with_non_mapping_payload_throws_exception(self, jwt):
         secret = "secret"
