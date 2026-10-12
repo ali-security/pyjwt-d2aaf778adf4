@@ -1,6 +1,7 @@
 import json
 import time
 from calendar import timegm
+from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -36,6 +37,61 @@ def payload():
 
 
 class TestJWT:
+    def test_decode_does_not_mutate_options_when_signature_verification_is_disabled(
+        self, jwt
+    ):
+        options = {"verify_signature": False}
+        token = jwt.encode({"claim": "value"}, "a" * 32, algorithm="HS256")
+        original_options = options.copy()
+
+        jwt.decode(token, options=options)
+
+        assert options == original_options
+
+    def test_reused_options_do_not_disable_claim_verification(self, jwt):
+        options = {"verify_signature": False}
+        token = jwt.encode({"exp": utc_timestamp() - 1}, "a" * 32, algorithm="HS256")
+
+        jwt.decode(token, options=options)
+        options["verify_signature"] = True
+
+        with pytest.raises(ExpiredSignatureError):
+            jwt.decode(token, "a" * 32, algorithms=["HS256"], options=options)
+
+    def test_decode_complete_preserves_mutable_mapping_input(self, jwt):
+        class MappingWithoutCopy(MutableMapping):
+            def __init__(self, values):
+                self._values = values
+
+            def __getitem__(self, key):
+                return self._values[key]
+
+            def __setitem__(self, key, value):
+                self._values[key] = value
+
+            def __delitem__(self, key):
+                del self._values[key]
+
+            def __iter__(self):
+                return iter(self._values)
+
+            def __len__(self):
+                return len(self._values)
+
+        options = MappingWithoutCopy({"verify_signature": False})
+        token = jwt.encode({"claim": "value"}, "a" * 32, algorithm="HS256")
+
+        jwt.decode_complete(token, options=options)
+
+        assert dict(options) == {"verify_signature": False}
+
+    def test_constructor_does_not_mutate_options_input(self, jwt):
+        options = {"verify_signature": False}
+
+        PyJWT(options=options)
+
+        assert options == {"verify_signature": False}
+
     def test_jwt_with_options(self):
         jwt = PyJWT(options={"verify_signature": False})
         assert jwt.options["verify_signature"] is False
